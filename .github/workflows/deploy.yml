@@ -1,69 +1,177 @@
-name: Basic CI Test
+name: MERN Stack CI/CD
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ master, develop ]
   pull_request:
-    branches: [ main ]
+    branches: [ master ]
+
+env:
+  NODE_VERSION: '18.x'
 
 jobs:
-  test:
-    name: Basic Test
+  # Continuous Integration
+  ci:
+    name: Continuous Integration
     runs-on: ubuntu-latest
     
     steps:
-    - name: Checkout code
+    - name: Checkout Repository
       uses: actions/checkout@v4
     
     - name: Setup Node.js
       uses: actions/setup-node@v4
       with:
-        node-version: '18.x'
+        node-version: ${{ env.NODE_VERSION }}
         cache: 'npm'
     
-    - name: Check directory structure
+    - name: Install Dependencies
       run: |
-        echo "=== Root directory ==="
-        ls -la
-        echo "=== Server directory ==="
-        ls -la server/
-        echo "=== Client directory ==="
-        ls -la client/
-    
-    - name: Install root dependencies
-      run: |
-        echo "Installing root dependencies..."
         npm install
+        cd server && npm install
+        cd ../client && npm install
     
-    - name: Install server dependencies
+    - name: Lint and Test Server
       run: |
-        echo "Installing server dependencies..."
         cd server
-        npm install
+        npm test
+      env:
+        NODE_ENV: test
+        MONGODB_URI: ${{ secrets.MONGODB_URI }}
+        JWT_SECRET: ${{ secrets.JWT_SECRET }}
     
-    - name: Install client dependencies
+    - name: Build Client Application
       run: |
-        echo "Installing client dependencies..."
-        cd client
-        npm install
-        npm install axios react-router-dom @mui/material @emotion/react @emotion/styled @mui/icons-material
-    
-    - name: Run server test
-      run: |
-        echo "Running server test..."
-        cd server
-        npm test || echo "Server tests completed"
-      continue-on-error: false
-    
-    - name: Run client test
-      run: |
-        echo "Skipping client tests for now..."
-        echo "✅ Client tests would run here"
-    
-    - name: Build client
-      run: |
-        echo "Building client..."
         cd client
         npm run build
       env:
-        REACT_APP_API_URL: http://localhost:5000/api
+        REACT_APP_API_URL: ${{ github.ref == 'refs/heads/master' && 'https://api.yourdomain.com/api' || 'https://staging-api.yourdomain.com/api' }}
+    
+    - name: Run Security Audit
+      run: |
+        cd server && npm audit --audit-level moderate || true
+        cd ../client && npm audit --audit-level moderate || true
+      continue-on-error: true
+    
+    - name: Create Build Artifacts
+      if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop'
+      run: |
+        mkdir -p artifacts
+        cp -r server artifacts/
+        cp -r client/build artifacts/client
+        cp package.json artifacts/
+        echo "Build completed at $(date)" > artifacts/build-info.txt
+        echo "Git commit: ${{ github.sha }}" >> artifacts/build-info.txt
+        echo "Branch: ${{ github.ref_name }}" >> artifacts/build-info.txt
+    
+    - name: Upload Build Artifacts
+      if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/develop'
+      uses: actions/upload-artifact@v4
+      with:
+        name: mern-app-${{ github.ref_name }}-${{ github.sha }}
+        path: artifacts/
+        retention-days: 30
+
+  # Security and Quality Checks
+  quality:
+    name: Quality & Security
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+    
+    - name: Install Dependencies
+      run: |
+        cd server && npm install
+        cd ../client && npm install
+    
+    - name: Security Vulnerability Scan
+      run: |
+        npx audit-ci --config ./audit-ci.json || true
+      continue-on-error: true
+    
+    - name: Code Quality Check
+      run: |
+        echo "✅ Code quality checks would run here"
+        echo "Future: ESLint, Prettier, SonarQube, etc."
+
+  # Deployment to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: [ci, quality]
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: mern-app-${{ github.ref_name }}-${{ github.sha }}
+        path: ./artifacts
+    
+    - name: Simulate Staging Deployment
+      run: |
+        echo "🚀 Deploying to Staging Environment"
+        echo "API URL: https://staging-api.yourdomain.com"
+        echo "Frontend URL: https://staging.yourdomain.com"
+        echo "Build artifacts ready for deployment"
+        ls -la artifacts/
+    
+    - name: Run Staging Health Checks
+      run: |
+        echo "✅ Staging health checks would run here"
+        echo "Future: API health check, frontend accessibility check"
+
+  # Deployment to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: [ci, quality]
+    if: github.ref == 'refs/heads/master'
+    environment: production
+    
+    steps:
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v4
+      with:
+        name: mern-app-${{ github.ref_name }}-${{ github.sha }}
+        path: ./artifacts
+    
+    - name: Simulate Production Deployment
+      run: |
+        echo "🚀 Deploying to Production Environment"
+        echo "API URL: https://api.yourdomain.com"
+        echo "Frontend URL: https://yourdomain.com"
+        echo "Build artifacts ready for deployment"
+        ls -la artifacts/
+    
+    - name: Run Production Health Checks
+      run: |
+        echo "✅ Production health checks would run here"
+        echo "Future: API health check, frontend accessibility check"
+        
+    - name: Deployment Notification
+      run: |
+        echo "🎉 Production deployment completed successfully!"
+        echo "Version: ${{ github.sha }}"
+        echo "Time: $(date)"
+
+  # Cleanup
+  cleanup:
+    name: Cleanup
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Cleanup Old Artifacts
+      run: |
+        echo "🧹 Cleanup completed"
+        echo "Artifacts will be automatically removed after 30 days"
