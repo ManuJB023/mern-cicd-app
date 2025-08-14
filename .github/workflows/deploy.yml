@@ -1,0 +1,265 @@
+name: MERN Stack CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  NODE_VERSION: '18.x'
+
+jobs:
+  # Testing Phase
+  test:
+    name: Test Application
+    runs-on: ubuntu-latest
+    
+    strategy:
+      matrix:
+        node-version: [16.x, 18.x, 20.x]
+        
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js ${{ matrix.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ matrix.node-version }}
+        cache: 'npm'
+        
+    - name: Install Root Dependencies
+      run: npm install
+        
+    - name: Install Server Dependencies
+      run: |
+        cd server
+        npm ci
+        
+    - name: Install Client Dependencies
+      run: |
+        cd client
+        npm ci
+        
+    - name: Run Server Tests
+      run: |
+        cd server
+        npm test
+      env:
+        NODE_ENV: test
+        MONGODB_URI: ${{ secrets.MONGODB_URI_TEST }}
+        JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        
+    - name: Run Client Tests
+      run: |
+        cd client
+        npm test -- --coverage --watchAll=false
+        
+    - name: Build Client
+      run: |
+        cd client
+        npm run build
+      env:
+        REACT_APP_API_URL: ${{ secrets.PRODUCTION_API_URL }}
+
+    - name: Upload Coverage Reports
+      uses: codecov/codecov-action@v3
+      with:
+        directory: ./client/coverage
+
+  # Security Scanning
+  security:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        
+    - name: Install Dependencies
+      run: |
+        cd server && npm ci
+        cd ../client && npm ci
+        
+    - name: Run Security Audit
+      run: |
+        cd server && npm audit --audit-level high
+        cd ../client && npm audit --audit-level high
+        
+    - name: Run Dependency Check
+      uses: dependency-check/Dependency-Check_Action@main
+      with:
+        project: 'mern-cicd-app'
+        path: '.'
+        format: 'ALL'
+
+  # Build Phase
+  build:
+    name: Build Application
+    runs-on: ubuntu-latest
+    needs: [test, security]
+    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/develop'
+    
+    steps:
+    - name: Checkout Repository
+      uses: actions/checkout@v4
+    
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ env.NODE_VERSION }}
+        cache: 'npm'
+        
+    - name: Install Dependencies
+      run: |
+        cd server && npm ci --only=production
+        cd ../client && npm ci
+        
+    - name: Build Client
+      run: |
+        cd client
+        npm run build
+      env:
+        REACT_APP_API_URL: ${{ github.ref == 'refs/heads/main' && secrets.PRODUCTION_API_URL || secrets.STAGING_API_URL }}
+        
+    - name: Create Deployment Package
+      run: |
+        mkdir -p deploy
+        cp -r server deploy/
+        cp -r client/build deploy/client
+        cp package.json deploy/
+        
+    - name: Upload Build Artifacts
+      uses: actions/upload-artifact@v3
+      with:
+        name: deployment-package
+        path: deploy/
+
+  # Deploy to Staging
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/develop'
+    environment: staging
+    
+    steps:
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: deployment-package
+        path: ./deploy
+        
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+        
+    - name: Deploy to EC2 (Staging)
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.STAGING_HOST }}
+        username: ${{ secrets.STAGING_USERNAME }}
+        key: ${{ secrets.STAGING_SSH_KEY }}
+        script: |
+          cd /var/www/mern-app-staging
+          git pull origin develop
+          cd server
+          npm install --production
+          pm2 restart mern-server-staging
+          
+    - name: Deploy Frontend to S3 (Staging)
+      run: |
+        cd deploy/client
+        aws s3 sync . s3://${{ secrets.STAGING_S3_BUCKET }} --delete
+        aws cloudfront create-invalidation --distribution-id ${{ secrets.STAGING_CLOUDFRONT_ID }} --paths "/*"
+        
+    - name: Run Smoke Tests
+      run: |
+        sleep 30
+        curl -f ${{ secrets.STAGING_API_URL }}/health || exit 1
+
+  # Deploy to Production
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: github.ref == 'refs/heads/main'
+    environment: production
+    
+    steps:
+    - name: Download Build Artifacts
+      uses: actions/download-artifact@v3
+      with:
+        name: deployment-package
+        path: ./deploy
+        
+    - name: Configure AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
+        
+    - name: Deploy to EC2 (Production)
+      uses: appleboy/ssh-action@v1.0.0
+      with:
+        host: ${{ secrets.PRODUCTION_HOST }}
+        username: ${{ secrets.PRODUCTION_USERNAME }}
+        key: ${{ secrets.PRODUCTION_SSH_KEY }}
+        script: |
+          cd /var/www/mern-app
+          git pull origin main
+          cd server
+          npm install --production
+          pm2 restart mern-server
+          
+    - name: Deploy Frontend to S3 (Production)
+      run: |
+        cd deploy/client
+        aws s3 sync . s3://${{ secrets.PRODUCTION_S3_BUCKET }} --delete
+        aws cloudfront create-invalidation --distribution-id ${{ secrets.PRODUCTION_CLOUDFRONT_ID }} --paths "/*"
+        
+    - name: Run Production Health Checks
+      run: |
+        sleep 30
+        curl -f ${{ secrets.PRODUCTION_API_URL }}/health || exit 1
+        
+    - name: Notify Deployment Success
+      uses: 8398a7/action-slack@v3
+      with:
+        status: success
+        text: 'Production deployment successful! 🚀'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: success()
+        
+    - name: Notify Deployment Failure
+      uses: 8398a7/action-slack@v3
+      with:
+        status: failure
+        text: 'Production deployment failed! ❌'
+      env:
+        SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+      if: failure()
+
+  # Cleanup
+  cleanup:
+    name: Cleanup Artifacts
+    runs-on: ubuntu-latest
+    needs: [deploy-staging, deploy-production]
+    if: always()
+    
+    steps:
+    - name: Delete Artifacts
+      uses: geekyeggo/delete-artifact@v2
+      with:
+        name: deployment-package
